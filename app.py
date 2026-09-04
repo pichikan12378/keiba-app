@@ -790,7 +790,7 @@ elif st.session_state.current_page == "create":
             selected_date = meeting["date"]
 
         # ---- ③ 決め方（レースから / 騎手から） ----
-        decide_mode = st.radio("決め方", ["レースを選ぶ", "🏇 騎手から決める"], horizontal=True)
+        decide_mode = st.radio("決め方", ["レースを選ぶ", "🏇 騎手を軸にする"], horizontal=True)
 
         if decide_mode == "レースを選ぶ":
             menu = fetch_race_menu(meeting["id"], is_local)
