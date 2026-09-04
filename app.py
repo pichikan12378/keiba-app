@@ -364,8 +364,16 @@ def _parse_meta(html):
     """レース名・開催日・発走時刻を取り出す。"""
     soup = BeautifulSoup(html, "html.parser")
     meta = {}
+    # 中央「競馬 - 2026年○○ 出馬表 - スポーツナビ」
+    # 地方「地方競馬 - 2026年○○ 出馬表 - スポーツナビ」
     title = soup.title.get_text(strip=True) if soup.title else ""
-    m = re.match(r"競馬\s*-\s*(?:\d{4}年)?(.*?)\s*(?:出馬表|オッズ|予想|結果)\s*-\s*スポーツナビ", title)
+    if not title:
+        og = soup.find("meta", attrs={"property": "og:title"})
+        title = og.get("content", "") if og else ""
+    m = re.search(
+        r"競馬\s*[-–—]\s*(?:\d{4}年)?(.+?)\s*(?:出馬表|オッズ|予想|結果)\s*[-–—]\s*スポーツナビ",
+        title,
+    )
     if m:
         meta["race_name"] = m.group(1).strip()
     text = soup.get_text(" ", strip=True)
