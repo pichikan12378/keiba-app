@@ -13,6 +13,21 @@ st.set_page_config(
     layout="centered"
 )
 
+# ============================================================
+# 合言葉による簡易アクセス制限
+# ============================================================
+PASSWORD = st.secrets.get("app_password", "")
+
+if PASSWORD and not st.session_state.get("authed"):
+    st.title("🏇 共同馬券アプリ")
+    pw = st.text_input("合言葉を入力してください", type="password")
+    if pw == PASSWORD:
+        st.session_state.authed = True
+        st.rerun()
+    elif pw:
+        st.error("合言葉が違います。")
+    st.stop()
+
 # 競馬場マスターデータ
 JYO_CHUO = ["東京", "中山", "阪神", "京都", "札幌", "函館", "福島", "新潟", "中京", "小倉"]
 JYO_CHIHO = ["帯広ば", "門別", "盛岡", "水沢", "浦和", "船橋", "大井", "川崎", "金沢",
