@@ -501,7 +501,7 @@ elif st.session_state.current_page == "result":
     unique_horses = sorted(set(all_selected))
     n = len(unique_horses)
 
-    st.metric("集約対象馬（重複なし）", f"計 {n} 頭")
+    st.metric("集約対象馬", f"計 {n} 頭")
 
     counts = {h: all_selected.count(h) for h in unique_horses}
     multi_picked = sorted([h for h, c in counts.items() if c > 1])
