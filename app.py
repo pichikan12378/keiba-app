@@ -22,11 +22,22 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* プルダウン内の検索入力欄にカーソル(キャレット)を出さない */
+    /* プルダウン内の検索入力欄を「文字入力できない」状態にする
+       - pointer-events:none でタップが親のコントロールに透過し、
+         入力欄自体はフォーカスされない（＝キーボードが出ない）
+       - クリックはプルダウンの開閉として機能する */
     div[data-baseweb="select"] input {
+        pointer-events: none !important;
         caret-color: transparent !important;
-        cursor: pointer !important;
         user-select: none !important;
+        -webkit-user-select: none !important;
+        width: 0 !important;
+        min-width: 0 !important;
+        opacity: 0 !important;
+    }
+    /* コントロール全体をタップ領域にし、指カーソルにする */
+    div[data-baseweb="select"] > div {
+        cursor: pointer !important;
     }
     </style>
     """,
@@ -82,6 +93,7 @@ def apply_ui_patch():
                 el.setAttribute('readonly', 'readonly');
                 el.setAttribute('inputmode', 'none');
                 el.setAttribute('autocomplete', 'off');
+                el.setAttribute('tabindex', '-1');
             });
 
             // 2) 画面上のテキストノードを走査して英語メッセージを日本語に置換
@@ -93,6 +105,29 @@ def apply_ui_patch():
                 if (jp !== null) node.nodeValue = jp;
             });
         }
+
+        // 3) 万一フォーカスされても文字が入らないよう、キー入力を無効化
+        //    （↑↓・Enter・Esc・Tab などの操作系キーだけ通す）
+        const ALLOW_KEYS = [
+            'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+            'Enter', 'Escape', 'Tab', 'Backspace', 'Delete'
+        ];
+        function isSelectInput(el) {
+            return el && el.tagName === 'INPUT' && el.closest &&
+                   el.closest('div[data-baseweb="select"]') !== null;
+        }
+        ['keydown', 'keypress', 'beforeinput', 'input', 'paste', 'compositionstart'
+        ].forEach(function (type) {
+            doc.addEventListener(type, function (e) {
+                if (!isSelectInput(e.target)) return;
+                if (type === 'keydown' || type === 'keypress') {
+                    if (ALLOW_KEYS.indexOf(e.key) !== -1) return;
+                }
+                e.preventDefault();
+                e.stopPropagation();
+                if (e.target.value) e.target.value = '';
+            }, true);
+        });
 
         patch();
         new MutationObserver(patch).observe(doc.body, { childList: true, subtree: true });
@@ -384,17 +419,32 @@ elif st.session_state.current_page == "input_choices":
     st.write(f"{race['title']} （{race['total_horses']}頭立から**ちょうど{target}頭**）")
 
     current_choices = race["choices"].get(member["id"], [])
-    selected_horses = st.multiselect(
-        "馬番を選択してください",
-        options=list(range(1, race["total_horses"] + 1)),
-        default=[h for h in current_choices if h <= race["total_horses"]],
-        max_selections=target,
-        placeholder="タップして馬番を選択",   # 【修正3】英語の初期表示を日本語化
-        key=f"ms_{race['id']}_{member['id']}",
-    )
+    horse_options = list(range(1, race["total_horses"] + 1))
+    default_horses = [h for h in current_choices if h <= race["total_horses"]]
+
+    # 🌟 プルダウンを使わず、タップで選ぶボタン形式（st.pills）を優先して使用
+    if hasattr(st, "pills"):
+        selected_horses = st.pills(
+            "馬番を選択してください（タップで選択／再タップで解除）",
+            options=horse_options,
+            selection_mode="multi",
+            default=default_horses,
+            key=f"pl_{race['id']}_{member['id']}",
+        ) or []
+    else:
+        selected_horses = st.multiselect(
+            "馬番を選択してください",
+            options=horse_options,
+            default=default_horses,
+            max_selections=target,
+            placeholder="タップして馬番を選択",
+            key=f"ms_{race['id']}_{member['id']}",
+        )
 
     if len(selected_horses) == target:
         st.success(f"選択数: {len(selected_horses)} / {target} 頭")
+    elif len(selected_horses) > target:
+        st.error(f"選択数: {len(selected_horses)} / {target} 頭（{len(selected_horses) - target}頭 多すぎます）")
     else:
         st.warning(f"選択数: {len(selected_horses)} / {target} 頭（あと{target - len(selected_horses)}頭）")
 
@@ -451,7 +501,7 @@ elif st.session_state.current_page == "result":
     unique_horses = sorted(set(all_selected))
     n = len(unique_horses)
 
-    st.metric("集約対象馬", f"計 {n} 頭")
+    st.metric("集約対象馬（重複なし）", f"計 {n} 頭")
 
     counts = {h: all_selected.count(h) for h in unique_horses}
     multi_picked = sorted([h for h, c in counts.items() if c > 1])
