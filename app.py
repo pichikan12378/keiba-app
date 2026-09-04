@@ -168,6 +168,119 @@ TICKETS = {
 DATA_FILE = Path("races_data.json")
 
 # ============================================================
+# 出馬表・単勝オッズの取得（スポーツナビ）
+#   出馬表 : /race/denma/{race_id}      → 馬番・馬名・騎手
+#   オッズ : /race/odds/tfw/{race_id}   → 馬番・単勝
+#   ※ 個人利用の範囲で。連打しないよう2分キャッシュしています。
+# ============================================================
+import re
+import requests
+from bs4 import BeautifulSoup
+
+UA = {"User-Agent": "Mozilla/5.0 (compatible; personal-hobby-app)"}
+RE_HORSE = re.compile(r"/directory/horse/")
+RE_JOCKEY = re.compile(r"/directory/jockey/")
+
+def parse_race_id(text):
+    """URLでもID直打ちでも、数字の並びだけ取り出す。"""
+    if not text:
+        return ""
+    m = re.findall(r"\d{8,}", str(text))
+    return m[-1] if m else ""
+
+def _get(url):
+    res = requests.get(url, headers=UA, timeout=10)
+    res.raise_for_status()
+    res.encoding = res.apparent_encoding
+    return res.text
+
+def _parse_table(html, kind):
+    """馬名リンクを起点に行を解析する（列位置の変更に強い）。"""
+    soup = BeautifulSoup(html, "html.parser")
+    result = {}
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all(["td", "th"])
+        idx = None
+        horse_a = None
+        for i, c in enumerate(cells):
+            a = c.find("a", href=RE_HORSE)
+            if a:
+                idx, horse_a = i, a
+                break
+        if horse_a is None:
+            continue
+
+        texts = [c.get_text(" ", strip=True) for c in cells]
+        nums = [t for t in texts[:idx] if re.fullmatch(r"\d{1,2}", t)]
+        if not nums:
+            continue
+        umaban = int(nums[-1])          # 枠番のあとに来る数字＝馬番
+
+        rec = result.setdefault(umaban, {"馬番": umaban})
+        rec["馬名"] = horse_a.get_text(strip=True)
+
+        if kind == "odds":
+            # 馬名より後ろの最初の小数＝単勝（複勝は "1.5 - 2.2" なので除外される）
+            odd = next((t for t in texts[idx + 1:]
+                        if re.fullmatch(r"\d+(\.\d+)?", t)), None)
+            rec["単勝"] = float(odd) if odd else None
+        else:
+            j = tr.find("a", href=RE_JOCKEY)
+            rec["騎手"] = j.get_text(strip=True) if j else ""
+    return result
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_race_info(race_id, is_local):
+    """馬番・馬名・騎手・単勝オッズを取得して馬番順のリストで返す。"""
+    base = "https://sports.yahoo.co.jp/keiba_local" if is_local else "https://sports.yahoo.co.jp/keiba"
+    data = {}
+    for kind, url in (("denma", f"{base}/race/denma/{race_id}"),
+                      ("odds", f"{base}/race/odds/tfw/{race_id}")):
+        try:
+            parsed = _parse_table(_get(url), kind)
+        except Exception:
+            parsed = {}
+        for num, rec in parsed.items():
+            data.setdefault(num, {}).update(rec)
+
+    rows = []
+    for num in sorted(data):
+        r = data[num]
+        rows.append({
+            "馬番": num,
+            "馬名": r.get("馬名", ""),
+            "騎手": r.get("騎手", ""),
+            "単勝": r.get("単勝"),
+        })
+    return rows
+
+def render_race_info(race, key_suffix=""):
+    """出馬表＋単勝オッズを表示する共通パーツ。"""
+    race_id = race.get("sn_race_id")
+    if not race_id:
+        return []
+
+    c1, c2 = st.columns([3, 1])
+    c1.markdown("##### 📰 出馬表・単勝オッズ")
+    if c2.button("🔄 更新", key=f"rf_{race['id']}_{key_suffix}", use_container_width=True):
+        fetch_race_info.clear()
+
+    rows = fetch_race_info(race_id, race.get("sn_local", False))
+    if not rows:
+        st.caption("※ データを取得できませんでした（発売前・レースID違い・サイト構造変更など）")
+        return []
+
+    ranked = sorted([r for r in rows if r["単勝"]], key=lambda r: r["単勝"])
+    pop = {r["馬番"]: i + 1 for i, r in enumerate(ranked)}
+    st.dataframe(
+        [{"馬番": r["馬番"], "馬名": r["馬名"], "騎手": r["騎手"],
+          "単勝": f"{r['単勝']:.1f}倍" if r["単勝"] else "—",
+          "人気": f"{pop[r['馬番']]}番人気" if r["馬番"] in pop else "—"} for r in rows],
+        use_container_width=True, hide_index=True,
+    )
+    return rows
+
+# ============================================================
 # 保存・読込
 # ============================================================
 def load_races():
@@ -344,6 +457,19 @@ elif st.session_state.current_page == "create":
     st.markdown("##### 🎯 本命の設定")
     use_favorite = st.checkbox("各メンバーに「本命馬(◎)」を1頭指定させる", value=False)
 
+    # 🌟 出馬表・オッズの取得元（任意）
+    st.markdown("##### 📰 出馬表・オッズの連携（任意）")
+    st.caption(
+        "スポーツナビで対象レースのページを開き、URLを貼り付けると "
+        "馬名・騎手・単勝オッズを表示できます。\n\n"
+        "中央: sports.yahoo.co.jp/keiba/race/index/**2604030408** ／ "
+        "地方: sports.yahoo.co.jp/keiba_local/... （IDだけでもOK）"
+    )
+    sn_url = st.text_input("レースURL または レースID", value="", placeholder="貼り付けると連携されます")
+    sn_race_id = parse_race_id(sn_url)
+    if sn_url and not sn_race_id:
+        st.warning("URLからレースIDを読み取れませんでした。")
+
     st.markdown("##### 👤 参加メンバー")
     members_input = st.text_input("参加者名（カンマ区切り）", value="Aさん, Bさん")
     members = [m.strip() for m in members_input.replace("、", ",").split(",") if m.strip()]
@@ -362,6 +488,8 @@ elif st.session_state.current_page == "create":
                 "total_horses": total_horses,
                 "target_count": target_count,
                 "use_favorite": use_favorite,  # 設定を保存
+                "sn_race_id": sn_race_id,      # スポナビのレースID
+                "sn_local": (cat == "地方"),
                 "members": [{"id": uuid.uuid4().hex, "name": name} for name in members],
                 "choices": {},
                 "favorites": {},  # 本命馬保存用
@@ -417,6 +545,8 @@ elif st.session_state.current_page == "input_choices":
     target = race["target_count"]
     st.title(f"🏇 {member['name']} さんの馬番入力")
     st.write(f"{race['title']} （{race['total_horses']}頭立から**ちょうど{target}頭**）")
+
+    render_race_info(race, key_suffix="input")
 
     current_choices = race["choices"].get(member["id"], [])
     horse_options = list(range(1, race["total_horses"] + 1))
@@ -501,12 +631,21 @@ elif st.session_state.current_page == "result":
     unique_horses = sorted(set(all_selected))
     n = len(unique_horses)
 
-    st.metric("集約対象馬", f"計 {n} 頭")
+    st.metric("集約対象馬（重複なし）", f"計 {n} 頭")
 
     counts = {h: all_selected.count(h) for h in unique_horses}
     multi_picked = sorted([h for h, c in counts.items() if c > 1])
 
     st.info(f"📍 **馬番:** {', '.join(map(str, unique_horses)) if unique_horses else 'なし'}")
+
+    # 🌟 集約対象馬の馬名・騎手・単勝オッズ
+    info_rows = render_race_info(race, key_suffix="result")
+    if info_rows and unique_horses:
+        picked_info = [r for r in info_rows if r["馬番"] in unique_horses]
+        if picked_info:
+            names = [f"{r['馬番']}{r['馬名']}({r['単勝']:.1f})" if r["単勝"]
+                     else f"{r['馬番']}{r['馬名']}" for r in picked_info]
+            st.caption("集約対象馬： " + " / ".join(names))
 
     with st.expander("🔍 各人の選択内訳・重複状況", expanded=False):
         st.markdown("**【各人の選択】**")
