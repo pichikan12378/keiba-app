@@ -453,27 +453,38 @@ def fetch_meetings(is_local):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_race_menu(meeting_id, is_local):
-    """開催一覧ページから {レース番号: レースID} を取り出す。"""
+    """開催一覧ページから {レース番号: レースID} を取り出す。
+    開催IDが12桁（レース単位リンク由来）でも動くよう、10桁に落として再試行する。"""
     base = BASE_LOCAL if is_local else BASE_CHUO
-    status, html, err = _get(f"{base}/race/list/{meeting_id}")
-    if status != 200 or not html:
-        return {}
-
-    soup = BeautifulSoup(html, "html.parser")
     mid = str(meeting_id)
-    menu = {}
-    for a in soup.find_all("a", href=True):
-        m = re.search(r"/race/(?:index|denma)/(\d{8,})", a["href"])
-        if not m:
+    candidates = [mid]
+    if len(mid) > 10:                      # 地方: 日次つき12桁 → 日付+場の10桁
+        candidates.append(mid[:10])
+
+    for cand in candidates:
+        status, html, err = _get(f"{base}/race/list/{cand}")
+        if status != 200 or not html:
             continue
-        rid = m.group(1)
-        if not rid.startswith(mid) or len(rid) <= len(mid):
-            continue
-        try:
-            menu[int(rid[-2:])] = rid
-        except ValueError:
-            pass
-    return menu
+        soup = BeautifulSoup(html, "html.parser")
+        menu = {}
+        for a in soup.find_all("a", href=True):
+            m = re.search(r"/race/[a-z_]+/(\d{8,})", a["href"])
+            if not m:
+                continue
+            rid = m.group(1)
+            if not rid.startswith(cand) or len(rid) <= len(cand):
+                continue
+            try:
+                menu[int(rid[-2:])] = rid
+            except ValueError:
+                pass
+        if menu:
+            return menu
+
+    # 一覧が読めなくても、日次まで判っていれば1〜12Rを組み立てられる
+    if len(mid) >= 12:
+        return {r: f"{mid}{r:02d}" for r in range(1, 13)}
+    return {}
 
 @st.cache_data(ttl=3600, show_spinner="開催全レースの出馬表を取得しています…")
 def fetch_meeting_jockeys(meeting_id, is_local):
@@ -482,7 +493,12 @@ def fetch_meeting_jockeys(meeting_id, is_local):
     menu = fetch_race_menu(meeting_id, is_local)
     races, jockeys, log = {}, {}, []
     if not menu:
-        return {"races": {}, "jockeys": {}, "log": ["レース一覧を取得できませんでした"]}
+        base = BASE_LOCAL if is_local else BASE_CHUO
+        return {"races": {}, "jockeys": {}, "log": [
+            f"開催ID: {meeting_id}",
+            f"{base}/race/list/{meeting_id}\n　→ レース一覧のリンクを取得できませんでした",
+        ]}
+    log.append(f"開催ID: {meeting_id} / {len(menu)}レース検出（{min(menu)}R〜{max(menu)}R）")
 
     base = BASE_LOCAL if is_local else BASE_CHUO
     for no in sorted(menu):
@@ -797,8 +813,10 @@ elif st.session_state.current_page == "create":
 
             if not jockeys:
                 st.warning("騎手情報を取得できませんでした。")
-                with st.expander("🔧 取得ログ"):
+                with st.expander("🔧 取得ログ", expanded=True):
                     st.code("\n".join(jdata["log"]) or "ログなし")
+                st.caption("※「レース一覧のリンクを取得できませんでした」の場合は、"
+                           "上の『レースを選ぶ』でレースIDが作れるか確認してみてください。")
             else:
                 names = sorted(jockeys, key=lambda n: (-len(jockeys[n]), n))
                 jockey = st.selectbox(
@@ -832,6 +850,8 @@ elif st.session_state.current_page == "create":
                     f"🎯 軸： {ride['umaban']}番 {ride['horse']}（{jockey}）"
                     + (f" / {info['count']}頭立" if info else "")
                 )
+                with st.expander("🔧 取得ログ"):
+                    st.code("\n".join(jdata["log"]) or "ログなし")
 
     # ---- ④ 出馬表を取得して設定に反映 ----
     if sn_race_id:
