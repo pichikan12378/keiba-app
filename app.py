@@ -282,6 +282,33 @@ def fetch_race_info(race_id, is_local):
         })
     return rows
 
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_race_meta(race_id, is_local):
+    """レース名・開催日・発走時刻を取得する。"""
+    base = "https://sports.yahoo.co.jp/keiba_local" if is_local else "https://sports.yahoo.co.jp/keiba"
+    try:
+        soup = BeautifulSoup(_get(f"{base}/race/denma/{race_id}"), "html.parser")
+    except Exception:
+        return {}
+
+    meta = {}
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    m = re.match(r"競馬\s*-\s*(?:\d{4}年)?(.*?)\s*(?:出馬表|オッズ|予想|結果)\s*-\s*スポーツナビ", title)
+    if m:
+        meta["race_name"] = m.group(1).strip()
+
+    text = soup.get_text(" ", strip=True)
+    d = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+    if d:
+        try:
+            meta["date"] = datetime.date(int(d.group(1)), int(d.group(2)), int(d.group(3)))
+        except ValueError:
+            pass
+    t = re.search(r"(\d{1,2}:\d{2})\s*発走", text)
+    if t:
+        meta["post_time"] = t.group(1)
+    return meta
+
 def render_race_info(race, key_suffix=""):
     """出馬表＋単勝オッズを表示する共通パーツ。"""
     race_id = race.get("sn_race_id")
@@ -399,6 +426,11 @@ def get_formation_combos(ticket_type, l1, l2, l3=None):
                             combos.append((a, b, c))
     return sorted(list(set(combos)))
 
+def reset_create_form():
+    """レース作成画面の一時領域（取得結果）をクリアする。"""
+    for k in ("cr_date", "cr_total_horses", "cr_race_name", "cr_preview"):
+        st.session_state.pop(k, None)
+
 def entered_count(race):
     member_ids = {m["id"] for m in race["members"]}
     return sum(1 for mid in race["choices"] if mid in member_ids)
@@ -470,22 +502,21 @@ if st.session_state.current_page == "main":
 elif st.session_state.current_page == "create":
     st.title("⚙️ レース設定")
 
+    # 取得結果を保持する一時領域（取得→rerun→各ウィジェットの初期値に反映）
     today = datetime.date.today()
-    selected_date = st.date_input("開催日付", value=today, format="YYYY/MM/DD")
+    st.session_state.setdefault("cr_date", today)
+    st.session_state.setdefault("cr_total_horses", 18)
+    st.session_state.setdefault("cr_race_name", "")
+    st.session_state.setdefault("cr_preview", [])
+
+    selected_date = st.date_input("開催日付", value=st.session_state.cr_date, format="YYYY/MM/DD")
 
     cat = st.selectbox("開催区分", ["中央", "地方"])
     jyo_list = JYO_CHUO if cat == "中央" else JYO_CHIHO
     jyo = st.selectbox("競馬場", jyo_list)
     r_num = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=10)
 
-    total_horses = st.selectbox("出走頭数", list(range(4, 19)), index=14)
-    target_count = st.selectbox("1人あたりの選択頭数", [2, 3, 4, 5], index=0)
-
-    # 🌟 本命指定の有無を設定（【修正2】初期値はチェックなし）
-    st.markdown("##### 🎯 本命の設定")
-    use_favorite = st.checkbox("各メンバーに「本命馬(◎)」を1頭指定させる", value=False)
-
-    # 🌟 出馬表・オッズの取得元（任意）
+    # 🌟 出馬表・オッズの連携（任意）
     st.markdown("##### 📰 出馬表・オッズの連携（任意）")
     link_mode = st.radio(
         "レースの指定方法",
@@ -517,6 +548,50 @@ elif st.session_state.current_page == "create":
         if sn_url and not sn_race_id:
             st.warning("URLからレースIDを読み取れませんでした。")
 
+    # 🌟 取得内容をレース設定に反映する
+    if sn_race_id:
+        if st.button("📥 出馬表を取得して設定に反映", use_container_width=True):
+            fetch_race_info.clear()
+            fetch_race_meta.clear()
+            rows = fetch_race_info(sn_race_id, cat == "地方")
+            meta = fetch_race_meta(sn_race_id, cat == "地方")
+            if not rows:
+                st.error("出馬表を取得できませんでした。レースIDをご確認ください。")
+            else:
+                st.session_state.cr_preview = rows
+                st.session_state.cr_total_horses = len(rows)
+                if meta.get("date"):
+                    st.session_state.cr_date = meta["date"]
+                st.session_state.cr_race_name = meta.get("race_name", "")
+                st.rerun()
+
+        if st.session_state.cr_preview:
+            name = st.session_state.cr_race_name
+            st.success(
+                f"✅ 反映しました：{name + ' / ' if name else ''}"
+                f"{st.session_state.cr_total_horses}頭立"
+            )
+            with st.expander("取得した出馬表を確認", expanded=False):
+                st.dataframe(
+                    [{"馬番": r["馬番"], "馬名": r["馬名"], "騎手": r["騎手"],
+                      "単勝": f"{r['単勝']:.1f}倍" if r["単勝"] else "—"}
+                     for r in st.session_state.cr_preview],
+                    use_container_width=True, hide_index=True,
+                )
+
+    horse_options = list(range(4, 19))
+    cur = st.session_state.cr_total_horses
+    total_horses = st.selectbox(
+        "出走頭数",
+        horse_options,
+        index=horse_options.index(cur) if cur in horse_options else 14,
+    )
+    target_count = st.selectbox("1人あたりの選択頭数", [2, 3, 4, 5], index=0)
+
+    # 🌟 本命指定の有無を設定（【修正2】初期値はチェックなし）
+    st.markdown("##### 🎯 本命の設定")
+    use_favorite = st.checkbox("各メンバーに「本命馬(◎)」を1頭指定させる", value=False)
+
     st.markdown("##### 👤 参加メンバー")
     members_input = st.text_input("参加者名（カンマ区切り）", value="Aさん, Bさん")
     members = [m.strip() for m in members_input.replace("、", ",").split(",") if m.strip()]
@@ -529,9 +604,13 @@ elif st.session_state.current_page == "create":
         else:
             weekdays = ["月", "火", "水", "木", "金", "土", "日"]
             date_str = f"{selected_date.month}/{selected_date.day}({weekdays[selected_date.weekday()]})"
+            race_name = st.session_state.get("cr_race_name", "") if sn_race_id else ""
+            title = f"{date_str} {jyo} {r_num}"
+            if race_name:
+                title += f" {race_name}"
             new_race = {
                 "id": uuid.uuid4().hex,
-                "title": f"{date_str} {jyo} {r_num}",
+                "title": title,
                 "total_horses": total_horses,
                 "target_count": target_count,
                 "use_favorite": use_favorite,  # 設定を保存
@@ -543,9 +622,11 @@ elif st.session_state.current_page == "create":
             }
             st.session_state.races.append(new_race)
             save_races()
+            reset_create_form()
             goto("member_select", race_id=new_race["id"])
 
     if st.button("← メイン画面に戻る", use_container_width=True):
+        reset_create_form()
         goto("main")
 
     apply_ui_patch()
