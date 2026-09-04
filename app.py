@@ -188,10 +188,8 @@ HEADERS = {
 BASE_CHUO = "https://sports.yahoo.co.jp/keiba"
 BASE_LOCAL = "https://sports.yahoo.co.jp/keiba_local"
 
-RE_HORSE = re.compile(r"/directory/horse/")
-RE_JOCKEY = re.compile(r"/directory/jockey/")
-RE_ODDS_CELL = re.compile(r"^\d+\s*\(\s*(\d+\.\d+)\s*\)$")   # 例: 8(22.0)
-RE_PLAIN_ODDS = re.compile(r"^\d+(?:\.\d+)?$")
+RE_ODDS_IN_PAREN = re.compile(r"\(\s*(\d+(?:\.\d+)?)\s*\)")   # 例: 11 (63.2)
+RE_SEX_AGE = re.compile(r"^(?:牡|牝|せん|セン|騸)\d")             # 例: 牡8/鹿毛
 
 def parse_race_id(text):
     """URLでもID直打ちでも、数字の並びだけ取り出す。"""
@@ -211,70 +209,124 @@ def _get(url):
     res.encoding = res.apparent_encoding or "utf-8"
     return res.status_code, res.text, ""
 
-def _parse_denma(html):
-    """出馬表を解析。馬名リンクを起点にするので列位置の変更に強い。"""
+# ------------------------------------------------------------
+# 表の解析（列見出しから位置を判定するのでリンクの有無に依存しない）
+#   ※ 中央は馬名/騎手がリンク、地方はリンクなし＋別サイトへのリンク
+# ------------------------------------------------------------
+def _find_table(html):
+    """「馬番」を含むヘッダー行を持つ表を探して (ヘッダー, 各行) を返す。"""
     soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        header, body = None, []
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["td", "th"])
+            if not cells:
+                continue
+            texts = [c.get_text(" ", strip=True) for c in cells]
+            if header is None:
+                if any("馬番" in t for t in texts):
+                    header = texts
+                continue
+            body.append(texts)
+        if header and body:
+            return header, body
+    return None, []
+
+def _col_index(header, pred):
+    for i, t in enumerate(header):
+        if pred(t.replace(" ", "").replace("\u3000", "")):
+            return i
+    return None
+
+def _cell(row, header, idx):
+    """枠番のrowspanでセルが1つ減る行に対応して値を取り出す。"""
+    if idx is None:
+        return ""
+    k = idx - (len(header) - len(row))
+    return row[k] if 0 <= k < len(row) else ""
+
+def _clean_name(text):
+    """「ラペルシェール 牡8/鹿毛」→ ラペルシェール"""
+    out = []
+    for part in text.split():
+        if part.startswith("(") or part.startswith("（") or RE_SEX_AGE.match(part):
+            break
+        out.append(part)
+    return " ".join(out).strip()
+
+def _clean_jockey(text):
+    """「谷内貫太 (大井) 55.0」「浜中 俊 55.0」→ 騎手名だけ"""
+    out = []
+    for part in text.split():
+        if part.startswith("(") or part.startswith("（") or re.fullmatch(r"\d+(?:\.\d+)?", part):
+            break
+        out.append(part)
+    return " ".join(out).strip()
+
+def _to_odds(text):
+    t = text.replace(" ", "")
+    m = RE_ODDS_IN_PAREN.search(t)          # 出馬表の「人気(オッズ)」
+    if m:
+        return float(m.group(1))
+    if re.fullmatch(r"\d+(?:\.\d+)?", t):   # オッズ表の「単勝」
+        return float(t)
+    return None
+
+def _parse_denma(html):
+    header, body = _find_table(html)
+    if not header:
+        return {}
+    i_num = _col_index(header, lambda t: t.startswith("馬番"))
+    i_name = _col_index(header, lambda t: t.startswith("馬名"))
+    i_jockey = _col_index(header, lambda t: t.startswith("騎手"))
+    i_odds = _col_index(header, lambda t: "オッズ" in t)
+    if i_num is None or i_name is None:
+        return {}
+
     result = {}
-    for tr in soup.find_all("tr"):
-        cells = tr.find_all(["td", "th"])
-        idx = horse_a = None
-        for i, c in enumerate(cells):
-            a = c.find("a", href=RE_HORSE)
-            if a:
-                idx, horse_a = i, a
-                break
-        if horse_a is None:
+    for row in body:
+        num_text = _cell(row, header, i_num).strip()
+        if not re.fullmatch(r"\d{1,2}", num_text):
             continue
-
-        texts = [c.get_text(" ", strip=True) for c in cells]
-        nums = [t for t in texts[:idx] if re.fullmatch(r"\d{1,2}", t)]
-        if not nums:
-            continue
-
-        umaban = int(nums[-1])                     # 枠番のあとの数字＝馬番
-        j = tr.find("a", href=RE_JOCKEY)
-        odds = None
-        for t in reversed(texts[idx + 1:]):        # 「人気(オッズ)」は行の後方
-            m = RE_ODDS_CELL.match(t.replace(" ", ""))
-            if m:
-                odds = float(m.group(1))
-                break
-        result[umaban] = {
-            "馬番": umaban,
-            "馬名": horse_a.get_text(strip=True),
-            "騎手": j.get_text(strip=True) if j else "",
-            "単勝": odds,
+        num = int(num_text)
+        result[num] = {
+            "馬番": num,
+            "馬名": _clean_name(_cell(row, header, i_name)),
+            "騎手": _clean_jockey(_cell(row, header, i_jockey)),
+            "単勝": _to_odds(_cell(row, header, i_odds)) if i_odds is not None else None,
         }
     return result
 
 def _parse_odds(html):
     """単複オッズ表から最新の単勝だけ拾う。"""
-    soup = BeautifulSoup(html, "html.parser")
+    header, body = _find_table(html)
+    if not header:
+        return {}
+    i_num = _col_index(header, lambda t: t.startswith("馬番"))
+    i_tan = _col_index(header, lambda t: t.startswith("単勝"))
+    if i_num is None or i_tan is None:
+        return {}
+
     result = {}
-    for tr in soup.find_all("tr"):
-        cells = tr.find_all(["td", "th"])
-        idx = horse_a = None
-        for i, c in enumerate(cells):
-            a = c.find("a", href=RE_HORSE)
-            if a:
-                idx, horse_a = i, a
-                break
-        if horse_a is None:
+    for row in body:
+        num_text = _cell(row, header, i_num).strip()
+        if not re.fullmatch(r"\d{1,2}", num_text):
             continue
-        texts = [c.get_text(" ", strip=True) for c in cells]
-        nums = [t for t in texts[:idx] if re.fullmatch(r"\d{1,2}", t)]
-        if not nums:
-            continue
-        odd = next((t for t in texts[idx + 1:] if RE_PLAIN_ODDS.fullmatch(t)), None)
-        if odd:
-            result[int(nums[-1])] = float(odd)
+        val = _to_odds(_cell(row, header, i_tan))
+        if val:
+            result[int(num_text)] = val
     return result
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_race_info(race_id, is_local):
     """{"rows": [...], "log": [...], "meta": {...}} を返す。中央/地方は自動で両方試す。"""
     log = []
-    bases = [BASE_LOCAL, BASE_CHUO] if is_local else [BASE_CHUO, BASE_LOCAL]
+    if len(str(race_id)) >= 13:          # 地方は日付始まりの14桁
+        bases = [BASE_LOCAL]
+    elif len(str(race_id)) <= 10:        # 中央は10桁
+        bases = [BASE_CHUO]
+    else:
+        bases = [BASE_LOCAL, BASE_CHUO] if is_local else [BASE_CHUO, BASE_LOCAL]
 
     for base in bases:
         url = f"{base}/race/denma/{race_id}"
