@@ -643,10 +643,8 @@ if st.session_state.current_page == "main":
             with st.container(border=True):
                 # 本命ありの場合はタイトル横にアイコンを表示
                 fav_icon = "🎯(本命あり)" if race.get("use_favorite") else ""
-                name_line = f"{race['race_name']}\n\n" if race.get("race_name") else ""
                 st.markdown(
                     f"**{race['title']}** {fav_icon}\n\n"
-                    f"{name_line}"
                     f"（全{race['total_horses']}頭立 / 各{race['target_count']}頭選択）"
                 )
 
@@ -790,10 +788,13 @@ elif st.session_state.current_page == "create":
             weekdays = ["月", "火", "水", "木", "金", "土", "日"]
             date_str = f"{selected_date.month}/{selected_date.day}({weekdays[selected_date.weekday()]})"
             race_name = st.session_state.get("cr_race_name", "") if sn_race_id else ""
+            title = f"{date_str} {jyo} {r_num}"
+            if race_name:
+                title += f" {race_name}"
             new_race = {
                 "id": uuid.uuid4().hex,
-                "title": f"{date_str} {jyo} {r_num}",
-                "race_name": race_name,   # タイトルとは分けて保持
+                "title": title,
+                "race_name": race_name,   # 個別に使いたいとき用に保持
                 "total_horses": total_horses,
                 "target_count": target_count,
                 "use_favorite": use_favorite,  # 設定を保存
@@ -821,8 +822,6 @@ elif st.session_state.current_page == "member_select":
     race = get_active_race()
     st.title("👤 参加者を選択")
     st.write(f"**{race['title']}** （各{race['target_count']}頭選択）")
-    if race.get("race_name"):
-        st.caption(race["race_name"])
 
     for member in race["members"]:
         mid = member["id"]
@@ -858,8 +857,6 @@ elif st.session_state.current_page == "input_choices":
     target = race["target_count"]
     st.title(f"🏇 {member['name']} さんの馬番入力")
     st.write(f"{race['title']} （{race['total_horses']}頭立から**ちょうど{target}頭**）")
-    if race.get("race_name"):
-        st.caption(race["race_name"])
 
     render_race_info(race, key_suffix="input")
 
@@ -940,8 +937,6 @@ elif st.session_state.current_page == "result":
 
     st.title("📊 集約＆買い目計算")
     st.subheader(f"【 {race['title']} 】")
-    if race.get("race_name"):
-        st.caption(race["race_name"])
 
     member_ids = [m["id"] for m in race["members"]]
     all_selected = [h for mid in member_ids for h in race["choices"].get(mid, [])]
