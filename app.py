@@ -229,6 +229,34 @@ def _parse_table(html, kind):
             rec["騎手"] = j.get_text(strip=True) if j else ""
     return result
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_meetings(is_local):
+    """スポナビのトップページから開催一覧（開催ID）を拾う。
+    レースIDは「開催ID(8桁) + レース番号(2桁)」で組み立てられる。"""
+    base = "https://sports.yahoo.co.jp/keiba_local" if is_local else "https://sports.yahoo.co.jp/keiba"
+    names = [j.replace("ば", "") for j in (JYO_CHIHO if is_local else JYO_CHUO)]
+    try:
+        soup = BeautifulSoup(_get(base + "/"), "html.parser")
+    except Exception:
+        return []
+
+    found = {}
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/race/(list|index)/(\d{8,})", a["href"])
+        if not m:
+            continue
+        kind, num = m.group(1), m.group(2)
+        base_id = num if kind == "list" else num[:-2]   # index は末尾2桁がR
+        label = a.get_text(" ", strip=True)
+        # 競馬場名を含むリンクだけを開催の目印にする
+        if not label or not any(n in label for n in names):
+            continue
+        found.setdefault(base_id, label)
+    return [{"id": k, "label": v} for k, v in found.items()]
+
+def build_race_id(base_id, race_no):
+    return f"{base_id}{int(race_no):02d}"
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_race_info(race_id, is_local):
     """馬番・馬名・騎手・単勝オッズを取得して馬番順のリストで返す。"""
@@ -459,16 +487,35 @@ elif st.session_state.current_page == "create":
 
     # 🌟 出馬表・オッズの取得元（任意）
     st.markdown("##### 📰 出馬表・オッズの連携（任意）")
-    st.caption(
-        "スポーツナビで対象レースのページを開き、URLを貼り付けると "
-        "馬名・騎手・単勝オッズを表示できます。\n\n"
-        "中央: sports.yahoo.co.jp/keiba/race/index/**2604030408** ／ "
-        "地方: sports.yahoo.co.jp/keiba_local/... （IDだけでもOK）"
+    link_mode = st.radio(
+        "レースの指定方法",
+        ["連携しない", "開催から自動取得", "URLを貼り付け"],
+        horizontal=False,
     )
-    sn_url = st.text_input("レースURL または レースID", value="", placeholder="貼り付けると連携されます")
-    sn_race_id = parse_race_id(sn_url)
-    if sn_url and not sn_race_id:
-        st.warning("URLからレースIDを読み取れませんでした。")
+    sn_race_id = ""
+
+    if link_mode == "開催から自動取得":
+        meetings = fetch_meetings(cat == "地方")
+        if not meetings:
+            st.warning("開催情報を取得できませんでした。URL貼り付けをお試しください。")
+        else:
+            key = jyo.replace("ば", "")
+            cands = [m for m in meetings if key in m["label"]] or meetings
+            pick = st.selectbox("開催を選択", [m["label"] for m in cands])
+            base_id = next(m["id"] for m in cands if m["label"] == pick)
+            sn_race_id = build_race_id(base_id, r_num[:-1])
+            st.caption(f"レースID: `{sn_race_id}`（{pick} の {r_num}）")
+            st.caption("※ 取得できるのは前後数日の開催のみです。")
+
+    elif link_mode == "URLを貼り付け":
+        st.caption(
+            "スポーツナビで対象レースのページを開き、URLを貼り付けてください。\n\n"
+            "例: sports.yahoo.co.jp/keiba/race/index/**2604030408**（IDだけでもOK）"
+        )
+        sn_url = st.text_input("レースURL または レースID", value="", placeholder="貼り付けると連携されます")
+        sn_race_id = parse_race_id(sn_url)
+        if sn_url and not sn_race_id:
+            st.warning("URLからレースIDを読み取れませんでした。")
 
     st.markdown("##### 👤 参加メンバー")
     members_input = st.text_input("参加者名（カンマ区切り）", value="Aさん, Bさん")
