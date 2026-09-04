@@ -801,7 +801,7 @@ elif st.session_state.current_page == "create":
             sn_race_id = menu.get(r_int) or build_race_id(meeting["id"], r_int)
             st.caption(f"レースID: `{sn_race_id}`")
         else:
-            st.caption("騎手を1人選び、その騎手の騎乗馬を全員共通の軸にします。")
+            st.markdown(":red[**騎手を1人選び、その騎手の騎乗馬を全員共通の軸にします。**]")
             c1, c2 = st.columns([3, 1])
             c1.caption("※ 開催全レースを読むので初回は10秒ほどかかります")
             if c2.button("🔄 再取得", use_container_width=True):
@@ -850,8 +850,7 @@ elif st.session_state.current_page == "create":
                     f"🎯 軸： {ride['umaban']}番 {ride['horse']}（{jockey}）"
                     + (f" / {info['count']}頭立" if info else "")
                 )
-                with st.expander("🔧 取得ログ"):
-                    st.code("\n".join(jdata["log"]) or "ログなし")
+
 
     # ---- ④ 出馬表を取得して設定に反映 ----
     if sn_race_id:
