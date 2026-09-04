@@ -175,6 +175,7 @@ DATA_FILE = Path("races_data.json")
 #   ※ 個人利用の範囲で。連打しないよう2分キャッシュしています。
 # ============================================================
 import re
+import time
 import requests
 from bs4 import BeautifulSoup, NavigableString
 
@@ -474,6 +475,43 @@ def fetch_race_menu(meeting_id, is_local):
             pass
     return menu
 
+@st.cache_data(ttl=3600, show_spinner="開催全レースの出馬表を取得しています…")
+def fetch_meeting_jockeys(meeting_id, is_local):
+    """開催の全レースを読み、騎手ごとの騎乗一覧を作る。
+    戻り値: {"races": {R: {...}}, "jockeys": {騎手名: [騎乗...]}, "log": [...]}"""
+    menu = fetch_race_menu(meeting_id, is_local)
+    races, jockeys, log = {}, {}, []
+    if not menu:
+        return {"races": {}, "jockeys": {}, "log": ["レース一覧を取得できませんでした"]}
+
+    base = BASE_LOCAL if is_local else BASE_CHUO
+    for no in sorted(menu):
+        rid = menu[no]
+        status, html, err = _get(f"{base}/race/denma/{rid}")
+        if status != 200 or not html:
+            log.append(f"{no}R → 取得できず（{err or f'HTTP {status}'}）")
+            continue
+        data = _parse_denma(html)
+        if not data:
+            log.append(f"{no}R → 出馬表なし（枠順未確定など）")
+            continue
+
+        rows = [data[n] for n in sorted(data)]
+        meta = _parse_meta(html)
+        races[no] = {"race_id": rid, "name": meta.get("race_name", ""),
+                     "count": len(rows), "rows": rows}
+        for r in rows:
+            if not r["騎手"]:
+                continue
+            jockeys.setdefault(r["騎手"], []).append({
+                "race_no": no, "race_id": rid, "umaban": r["馬番"],
+                "horse": r["馬名"], "odds": r["単勝"],
+            })
+        time.sleep(0.2)      # 連続アクセスを避ける
+
+    log.append(f"{len(races)}レース / 騎手{len(jockeys)}人を取得")
+    return {"races": races, "jockeys": jockeys, "log": log}
+
 def build_race_id(base_id, race_no):
     return f"{base_id}{int(race_no):02d}"
 
@@ -650,7 +688,12 @@ if st.session_state.current_page == "main":
 
             with st.container(border=True):
                 # 本命ありの場合はタイトル横にアイコンを表示
-                fav_icon = "🎯(本命あり)" if race.get("use_favorite") else ""
+                if race.get("axis"):
+                    fav_icon = f"🏇(軸 {race['axis']['馬番']}番)"
+                elif race.get("use_favorite"):
+                    fav_icon = "🎯(本命あり)"
+                else:
+                    fav_icon = ""
                 st.markdown(
                     f"**{race['title']}** {fav_icon}\n\n"
                     f"（全{race['total_horses']}頭立 / 各{race['target_count']}頭選択）"
@@ -715,6 +758,7 @@ elif st.session_state.current_page == "create":
     picked = st.selectbox("開催", options, index=0 if cands else len(options) - 1)
 
     sn_race_id = ""
+    axis_info = None
     if picked == MANUAL:
         jyo = st.selectbox("競馬場", JYO_CHUO if not is_local else JYO_CHIHO)
         r_num = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=10)
@@ -729,14 +773,65 @@ elif st.session_state.current_page == "create":
         if meeting["date"]:
             selected_date = meeting["date"]
 
-        # ---- ③ その開催のレース番号を出す ----
-        menu = fetch_race_menu(meeting["id"], is_local)
-        race_nos = sorted(menu) if menu else list(range(1, 13))
-        r_int = st.selectbox("レース番号", race_nos, index=len(race_nos) - 1,
-                             format_func=lambda n: f"{n}R")
-        r_num = f"{r_int}R"
-        sn_race_id = menu.get(r_int) or build_race_id(meeting["id"], r_int)
-        st.caption(f"レースID: `{sn_race_id}`")
+        # ---- ③ 決め方（レースから / 騎手から） ----
+        decide_mode = st.radio("決め方", ["レースを選ぶ", "🏇 騎手から決める"], horizontal=True)
+
+        if decide_mode == "レースを選ぶ":
+            menu = fetch_race_menu(meeting["id"], is_local)
+            race_nos = sorted(menu) if menu else list(range(1, 13))
+            r_int = st.selectbox("レース番号", race_nos, index=len(race_nos) - 1,
+                                 format_func=lambda n: f"{n}R")
+            r_num = f"{r_int}R"
+            sn_race_id = menu.get(r_int) or build_race_id(meeting["id"], r_int)
+            st.caption(f"レースID: `{sn_race_id}`")
+        else:
+            st.caption("騎手を1人選び、その騎手の騎乗馬を全員共通の軸にします。")
+            c1, c2 = st.columns([3, 1])
+            c1.caption("※ 開催全レースを読むので初回は10秒ほどかかります")
+            if c2.button("🔄 再取得", use_container_width=True):
+                fetch_meeting_jockeys.clear()
+                fetch_race_menu.clear()
+
+            jdata = fetch_meeting_jockeys(meeting["id"], is_local)
+            jockeys = jdata["jockeys"]
+
+            if not jockeys:
+                st.warning("騎手情報を取得できませんでした。")
+                with st.expander("🔧 取得ログ"):
+                    st.code("\n".join(jdata["log"]) or "ログなし")
+            else:
+                names = sorted(jockeys, key=lambda n: (-len(jockeys[n]), n))
+                jockey = st.selectbox(
+                    "騎手", names,
+                    format_func=lambda n: f"{n}（{len(jockeys[n])}鞍）",
+                )
+                rides = sorted(jockeys[jockey], key=lambda r: r["race_no"])
+
+                def _ride_label(r):
+                    odds = f"　{r['odds']:.1f}倍" if r["odds"] else ""
+                    return f"{r['race_no']}R　{r['umaban']}番 {r['horse']}{odds}"
+
+                ride = rides[st.radio(
+                    "どのレースをやる？",
+                    range(len(rides)),
+                    format_func=lambda i: _ride_label(rides[i]),
+                )]
+
+                r_int = ride["race_no"]
+                r_num = f"{r_int}R"
+                sn_race_id = ride["race_id"]
+                axis_info = {"馬番": ride["umaban"], "馬名": ride["horse"], "騎手": jockey}
+
+                # 取得済みの情報をそのまま設定へ反映（ボタン操作は不要）
+                info = jdata["races"].get(r_int, {})
+                if info:
+                    st.session_state.cr_total_horses = info["count"]
+                    st.session_state.cr_race_name = info.get("name", "")
+                    st.session_state.cr_preview = info["rows"]
+                st.success(
+                    f"🎯 軸： {ride['umaban']}番 {ride['horse']}（{jockey}）"
+                    + (f" / {info['count']}頭立" if info else "")
+                )
 
     # ---- ④ 出馬表を取得して設定に反映 ----
     if sn_race_id:
@@ -808,6 +903,7 @@ elif st.session_state.current_page == "create":
                 "use_favorite": use_favorite,  # 設定を保存
                 "sn_race_id": sn_race_id,      # スポナビのレースID
                 "sn_local": (cat == "地方"),
+                "axis": axis_info,             # 全員共通の軸（騎手モード）
                 "members": [{"id": uuid.uuid4().hex, "name": name} for name in members],
                 "choices": {},
                 "favorites": {},  # 本命馬保存用
@@ -868,12 +964,24 @@ elif st.session_state.current_page == "input_choices":
 
     render_race_info(race, key_suffix="input")
 
+    axis = race.get("axis")
+    axis_num = axis["馬番"] if axis else None
+
     current_choices = race["choices"].get(member["id"], [])
-    horse_options = list(range(1, race["total_horses"] + 1))
-    default_horses = [h for h in current_choices if h <= race["total_horses"]]
+    horse_options = [h for h in range(1, race["total_horses"] + 1) if h != axis_num]
+    default_horses = [h for h in current_choices
+                      if h <= race["total_horses"] and h != axis_num]
+    need = target - 1 if axis else target
+
+    if axis:
+        st.info(f"🎯 **軸（全員共通）: {axis['馬番']}番 {axis['馬名']}**　騎手: {axis['騎手']}")
+        st.write(f"残り **{need}頭** を選んでください。")
 
     # 🌟 プルダウンを使わず、タップで選ぶボタン形式（st.pills）を優先して使用
-    if hasattr(st, "pills"):
+    if need <= 0:
+        selected_horses = []
+        st.caption("このレースは軸のみで確定です。")
+    elif hasattr(st, "pills"):
         selected_horses = st.pills(
             "馬番を選択してください（タップで選択／再タップで解除）",
             options=horse_options,
@@ -886,21 +994,24 @@ elif st.session_state.current_page == "input_choices":
             "馬番を選択してください",
             options=horse_options,
             default=default_horses,
-            max_selections=target,
+            max_selections=need,
             placeholder="タップして馬番を選択",
             key=f"ms_{race['id']}_{member['id']}",
         )
 
-    if len(selected_horses) == target:
-        st.success(f"選択数: {len(selected_horses)} / {target} 頭")
-    elif len(selected_horses) > target:
-        st.error(f"選択数: {len(selected_horses)} / {target} 頭（{len(selected_horses) - target}頭 多すぎます）")
-    else:
-        st.warning(f"選択数: {len(selected_horses)} / {target} 頭（あと{target - len(selected_horses)}頭）")
+    if need > 0:
+        if len(selected_horses) == need:
+            st.success(f"選択数: {len(selected_horses)} / {need} 頭")
+        elif len(selected_horses) > need:
+            st.error(f"選択数: {len(selected_horses)} / {need} 頭（{len(selected_horses) - need}頭 多すぎます）")
+        else:
+            st.warning(f"選択数: {len(selected_horses)} / {need} 頭（あと{need - len(selected_horses)}頭）")
 
     # 🌟 本命設定がONの場合のみ、本命選択ラジオボタンを表示
     favorite_horse = None
-    if race.get("use_favorite", False) and selected_horses:
+    if axis:
+        favorite_horse = axis_num
+    elif race.get("use_favorite", False) and selected_horses:
         st.markdown("##### 🎯 本命馬の選択")
         current_favorite = race.get("favorites", {}).get(member["id"])
 
@@ -918,13 +1029,14 @@ elif st.session_state.current_page == "input_choices":
         )
 
     if st.button("この内容で保存する", type="primary", use_container_width=True):
-        if len(selected_horses) != target:
-            st.error(f"ちょうど {target} 頭選択してください。")
+        if len(selected_horses) != need:
+            st.error(f"ちょうど {need} 頭選択してください。")
         else:
-            race["choices"][member["id"]] = sorted(selected_horses)
+            picks = selected_horses + ([axis_num] if axis else [])
+            race["choices"][member["id"]] = sorted(picks)
 
-            # 本命ありの場合はデータも保存
-            if race.get("use_favorite", False):
+            # 本命（軸）ありの場合はデータも保存
+            if axis or race.get("use_favorite", False):
                 if "favorites" not in race:
                     race["favorites"] = {}
                 race["favorites"][member["id"]] = favorite_horse
@@ -957,6 +1069,10 @@ elif st.session_state.current_page == "result":
     multi_picked = sorted([h for h, c in counts.items() if c > 1])
 
     st.info(f"📍 **馬番:** {', '.join(map(str, unique_horses)) if unique_horses else 'なし'}")
+
+    axis = race.get("axis")
+    if axis:
+        st.success(f"🎯 **軸（全員共通）: {axis['馬番']}番 {axis['馬名']}**　騎手: {axis['騎手']}")
 
     # 🌟 集約対象馬の馬名・騎手・単勝オッズ
     info_rows = render_race_info(race, key_suffix="result")
@@ -1002,8 +1118,11 @@ elif st.session_state.current_page == "result":
     else:
         st.markdown("##### 🛠 フォーメーション設定")
 
-        # 本命あり/なしで1列目の初期値を切り替え
-        if race.get("use_favorite", False):
+        # 軸あり／本命あり／なしで1列目の初期値を切り替え
+        if axis and axis["馬番"] in unique_horses:
+            st.caption("💡 *全員共通の軸を1列目にセットしています。*")
+            default_core = [axis["馬番"]]
+        elif race.get("use_favorite", False):
             st.caption("💡 *初期値として「誰かの本命馬(◎)」を1列目にセットしています。*")
             all_favorites = [race.get("favorites", {}).get(mid) for mid in member_ids]
             unique_favorites = sorted(list(set([f for f in all_favorites if f is not None])))
