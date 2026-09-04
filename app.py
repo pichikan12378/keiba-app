@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import itertools
 import datetime
 import json
@@ -12,6 +13,76 @@ st.set_page_config(
     page_icon="🏇",
     layout="centered"
 )
+
+# ============================================================
+# 【修正1・3】UI調整
+#   ・プルダウン(selectbox/multiselect)をタップしても文字入力できないようにする
+#   ・Streamlit標準の英語メッセージを日本語に置き換える
+# ============================================================
+st.markdown(
+    """
+    <style>
+    /* プルダウン内の検索入力欄にカーソル(キャレット)を出さない */
+    div[data-baseweb="select"] input {
+        caret-color: transparent !important;
+        cursor: pointer !important;
+        user-select: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+def apply_ui_patch():
+    """プルダウンを読み取り専用にし、英語表記を日本語へ置換する。"""
+    components.html(
+        """
+        <script>
+        const doc = window.parent.document;
+        const DICT = {
+            "Choose an option": "タップして選択",
+            "Choose options": "タップして選択",
+            "No options to select.": "選択できる項目がありません",
+            "No results": "該当する項目がありません",
+            "You have reached the maximum number of allowed selections.":
+                "選択できる上限に達しました",
+            "Press Enter to apply": "",
+            "Press Enter to submit form": "",
+            "Deselect all": "すべて解除",
+            "Clear all": "すべて解除"
+        };
+
+        function patch() {
+            // 1) 入力欄を読み取り専用にしてスマホのキーボードを出さない
+            doc.querySelectorAll('div[data-baseweb="select"] input').forEach(function (el) {
+                el.readOnly = true;
+                el.setAttribute('readonly', 'readonly');
+                el.setAttribute('inputmode', 'none');
+                el.setAttribute('autocomplete', 'off');
+            });
+
+            // 2) 英語メッセージを日本語に置換
+            const targets = doc.querySelectorAll(
+                'div[data-baseweb="popover"] li, div[data-baseweb="popover"] div, ' +
+                '[data-testid="stWidgetInstructions"], ' +
+                'div[data-baseweb="select"] div'
+            );
+            targets.forEach(function (el) {
+                if (el.children.length > 0) return;
+                const t = el.textContent.trim();
+                if (t in DICT && t !== DICT[t]) {
+                    el.textContent = DICT[t];
+                }
+            });
+        }
+
+        patch();
+        new MutationObserver(patch).observe(doc.body, { childList: true, subtree: true });
+        setInterval(patch, 400);
+        </script>
+        """,
+        height=0,
+    )
 
 # ============================================================
 # 合言葉による簡易アクセス制限
@@ -206,7 +277,7 @@ elif st.session_state.current_page == "create":
     st.title("⚙️ レース設定")
 
     today = datetime.date.today()
-    selected_date = st.date_input("開催日付", value=today)
+    selected_date = st.date_input("開催日付", value=today, format="YYYY/MM/DD")
 
     cat = st.selectbox("開催区分", ["中央", "地方"])
     jyo_list = JYO_CHUO if cat == "中央" else JYO_CHIHO
@@ -216,9 +287,9 @@ elif st.session_state.current_page == "create":
     total_horses = st.selectbox("出走頭数", list(range(4, 19)), index=14)
     target_count = st.selectbox("1人あたりの選択頭数", [2, 3, 4, 5], index=0)
 
-    # 🌟 追加: 本命指定の有無を設定
+    # 🌟 本命指定の有無を設定（【修正2】初期値はチェックなし）
     st.markdown("##### 🎯 本命の設定")
-    use_favorite = st.checkbox("各メンバーに「本命馬(◎)」を1頭指定させる", value=True)
+    use_favorite = st.checkbox("各メンバーに「本命馬(◎)」を1頭指定させる", value=False)
 
     st.markdown("##### 👤 参加メンバー")
     members_input = st.text_input("参加者名（カンマ区切り）", value="Aさん, Bさん")
@@ -237,10 +308,10 @@ elif st.session_state.current_page == "create":
                 "title": f"{date_str} {jyo} {r_num}",
                 "total_horses": total_horses,
                 "target_count": target_count,
-                "use_favorite": use_favorite, # 設定を保存
+                "use_favorite": use_favorite,  # 設定を保存
                 "members": [{"id": uuid.uuid4().hex, "name": name} for name in members],
                 "choices": {},
-                "favorites": {}, # 本命馬保存用
+                "favorites": {},  # 本命馬保存用
             }
             st.session_state.races.append(new_race)
             save_races()
@@ -248,6 +319,8 @@ elif st.session_state.current_page == "create":
 
     if st.button("← メイン画面に戻る", use_container_width=True):
         goto("main")
+
+    apply_ui_patch()
 
 # ============================================================
 # 画面3: 参加者選択画面
@@ -298,6 +371,7 @@ elif st.session_state.current_page == "input_choices":
         options=list(range(1, race["total_horses"] + 1)),
         default=[h for h in current_choices if h <= race["total_horses"]],
         max_selections=target,
+        placeholder="タップして馬番を選択",   # 【修正3】英語の初期表示を日本語化
         key=f"ms_{race['id']}_{member['id']}",
     )
 
@@ -306,12 +380,12 @@ elif st.session_state.current_page == "input_choices":
     else:
         st.warning(f"選択数: {len(selected_horses)} / {target} 頭（あと{target - len(selected_horses)}頭）")
 
-    # 🌟 追加: 本命設定がONの場合のみ、本命選択ラジオボタンを表示
+    # 🌟 本命設定がONの場合のみ、本命選択ラジオボタンを表示
     favorite_horse = None
     if race.get("use_favorite", False) and selected_horses:
         st.markdown("##### 🎯 本命馬の選択")
         current_favorite = race.get("favorites", {}).get(member["id"])
-        
+
         # 以前の本命がまだ選択肢に含まれていればそれをデフォルトに
         if current_favorite in selected_horses:
             default_index = selected_horses.index(current_favorite)
@@ -330,18 +404,20 @@ elif st.session_state.current_page == "input_choices":
             st.error(f"ちょうど {target} 頭選択してください。")
         else:
             race["choices"][member["id"]] = sorted(selected_horses)
-            
+
             # 本命ありの場合はデータも保存
             if race.get("use_favorite", False):
                 if "favorites" not in race:
                     race["favorites"] = {}
                 race["favorites"][member["id"]] = favorite_horse
-                
+
             save_races()
             goto("member_select")
 
     if st.button("← 参加者選択に戻る", use_container_width=True):
         goto("member_select")
+
+    apply_ui_patch()
 
 # ============================================================
 # 画面5: 集約＆計算結果画面
@@ -357,20 +433,20 @@ elif st.session_state.current_page == "result":
     unique_horses = sorted(set(all_selected))
     n = len(unique_horses)
 
-    st.metric("集約対象馬（重複なし）", f"計 {n} 頭")
-    
+    st.metric("集約対象馬", f"計 {n} 頭")
+
     counts = {h: all_selected.count(h) for h in unique_horses}
-    multi_picked = sorted([h for h, c in counts.items() if c > 1]) 
-    
+    multi_picked = sorted([h for h, c in counts.items() if c > 1])
+
     st.info(f"📍 **馬番:** {', '.join(map(str, unique_horses)) if unique_horses else 'なし'}")
-    
+
     with st.expander("🔍 各人の選択内訳・重複状況", expanded=False):
         st.markdown("**【各人の選択】**")
         for m in race["members"]:
             mid = m["id"]
             picked = sorted(race["choices"].get(mid, []))
-            
-            # 🌟 変更: 本命ありの場合は「◎」をつけて表示
+
+            # 本命ありの場合は「◎」をつけて表示
             if race.get("use_favorite", False):
                 fav = race.get("favorites", {}).get(mid)
                 display_picked = [f"◎{h}" if h == fav else str(h) for h in picked]
@@ -379,7 +455,7 @@ elif st.session_state.current_page == "result":
                 st.write(f"- {m['name']}: {picked if picked else '未入力'}")
 
         st.markdown("**【重複した馬番（軸候補）】**")
-        dup_text = [f"{h}番 ({c}人被り)" 
+        dup_text = [f"{h}番 ({c}人被り)"
                     for h, c in sorted(counts.items(), key=lambda x: (-x[1], x[0])) if c > 1]
         if dup_text:
             st.markdown(f":red[{', '.join(dup_text)}]")
@@ -396,10 +472,10 @@ elif st.session_state.current_page == "result":
         st.caption(f"全 {n} 頭のBOX買いを計算します。")
         combos = build_combinations(unique_horses, ticket_type)
         total_points = len(combos)
-    else: 
+    else:
         st.markdown("##### 🛠 フォーメーション設定")
-        
-        # 🌟 変更: 本命あり/なしで1列目の初期値を切り替え
+
+        # 本命あり/なしで1列目の初期値を切り替え
         if race.get("use_favorite", False):
             st.caption("💡 *初期値として「誰かの本命馬(◎)」を1列目にセットしています。*")
             all_favorites = [race.get("favorites", {}).get(mid) for mid in member_ids]
@@ -410,12 +486,15 @@ elif st.session_state.current_page == "result":
             default_core = multi_picked if multi_picked else unique_horses
 
         col_f1, col_f2 = st.columns(2)
-        f1 = col_f1.multiselect("1列目", unique_horses, default=default_core)
-        f2 = col_f2.multiselect("2列目", unique_horses, default=unique_horses)
+        f1 = col_f1.multiselect("1列目", unique_horses, default=default_core,
+                                placeholder="タップして選択")
+        f2 = col_f2.multiselect("2列目", unique_horses, default=unique_horses,
+                                placeholder="タップして選択")
 
         f3 = []
         if ticket_type in ["3連複", "3連単"]:
-            f3 = st.multiselect("3列目", unique_horses, default=unique_horses)
+            f3 = st.multiselect("3列目", unique_horses, default=unique_horses,
+                                placeholder="タップして選択")
 
         combos = get_formation_combos(ticket_type, f1, f2, f3)
         total_points = len(combos)
@@ -457,3 +536,5 @@ elif st.session_state.current_page == "result":
     st.divider()
     if st.button("← レース一覧に戻る", use_container_width=True):
         goto("main")
+
+    apply_ui_patch()
