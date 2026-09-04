@@ -414,11 +414,17 @@ def fetch_meetings(is_local):
         m = re.search(r"/race/(list|index)/(\d{8,})", node["href"])
         if not m:
             continue
-        num = m.group(2)
-        mid = num if m.group(1) == "list" else num[:-2]
-        label = node.get_text(" ", strip=True)
-        if not label or not any(n in label for n in names):
+        kind, num = m.group(1), m.group(2)
+        mid = num if kind == "list" else num[:-2]
+        text = node.get_text(" ", strip=True)
+        # リンク文字は「大井」だけとは限らない（例:「大井 5R 16:58 発走」）
+        matched = next((n for n in names if n in text), None)
+        if not matched:
             continue
+
+        # 中央の「2回札幌3日」という表記だけはそのまま活かす
+        compact = text.replace(" ", "")
+        label = compact if re.fullmatch(r"\d+回\D+\d+日", compact) else matched
 
         day = cur_date
         if len(mid) >= 10:      # 地方は先頭8桁が開催日
@@ -426,9 +432,15 @@ def fetch_meetings(is_local):
                 day = datetime.date(int(mid[:4]), int(mid[4:6]), int(mid[6:8]))
             except ValueError:
                 pass
-        results.setdefault(mid, {"id": mid, "label": label, "date": day})
 
-    return sorted(results.values(), key=lambda m: (m["date"] or datetime.date.min, m["label"]))
+        # 同じ日・同じ競馬場は1件にまとめ、一覧ページ(list)のリンクを優先する
+        key = (day, matched)
+        prev = results.get(key)
+        if prev is None or (prev["kind"] == "index" and kind == "list"):
+            results[key] = {"id": mid, "label": label, "jyo": matched,
+                            "date": day, "kind": kind}
+
+    return sorted(results.values(), key=lambda m: (m["date"] or datetime.date.min, m["jyo"]))
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_race_menu(meeting_id, is_local):
@@ -696,7 +708,7 @@ elif st.session_state.current_page == "create":
             st.warning("URLからレースIDを読み取れませんでした。")
     else:
         meeting = cands[options.index(picked)]
-        jyo = meeting["label"]
+        jyo = meeting.get("jyo") or meeting["label"]
         if meeting["date"]:
             selected_date = meeting["date"]
 
