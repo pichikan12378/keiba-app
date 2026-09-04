@@ -39,11 +39,14 @@ def apply_ui_patch():
         """
         <script>
         const doc = window.parent.document;
+        // 完全一致で置換するもの
         const DICT = {
             "Choose an option": "タップして選択",
             "Choose options": "タップして選択",
             "No options to select.": "選択できる項目がありません",
+            "No options.": "選択できる項目がありません",
             "No results": "該当する項目がありません",
+            "No results found": "該当する項目がありません",
             "You have reached the maximum number of allowed selections.":
                 "選択できる上限に達しました",
             "Press Enter to apply": "",
@@ -51,6 +54,26 @@ def apply_ui_patch():
             "Deselect all": "すべて解除",
             "Clear all": "すべて解除"
         };
+
+        // 数字などが変化する英語メッセージ用（正規表現で置換）
+        const RULES = [
+            [/^You can only select 1 option\\..*$/i,
+             "選択できるのは1頭までです。変更する場合は選択済みの馬番を外してください。"],
+            [/^You can only select (\\d+) options?\\..*$/i,
+             "選択できるのは$1頭までです。変更する場合は選択済みの馬番を外してください。"],
+            [/^You have reached the maximum number of allowed selections\\.?.*$/i,
+             "選択できる上限に達しました。変更する場合は選択済みの馬番を外してください。"]
+        ];
+
+        function fixText(raw) {
+            const t = raw.trim();
+            if (!t) return null;
+            if (t in DICT && DICT[t] !== t) return DICT[t];
+            for (const [re, rep] of RULES) {
+                if (re.test(t)) return t.replace(re, rep);
+            }
+            return null;
+        }
 
         function patch() {
             // 1) 入力欄を読み取り専用にしてスマホのキーボードを出さない
@@ -61,24 +84,19 @@ def apply_ui_patch():
                 el.setAttribute('autocomplete', 'off');
             });
 
-            // 2) 英語メッセージを日本語に置換
-            const targets = doc.querySelectorAll(
-                'div[data-baseweb="popover"] li, div[data-baseweb="popover"] div, ' +
-                '[data-testid="stWidgetInstructions"], ' +
-                'div[data-baseweb="select"] div'
-            );
-            targets.forEach(function (el) {
-                if (el.children.length > 0) return;
-                const t = el.textContent.trim();
-                if (t in DICT && t !== DICT[t]) {
-                    el.textContent = DICT[t];
-                }
+            // 2) 画面上のテキストノードを走査して英語メッセージを日本語に置換
+            const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
+            const nodes = [];
+            while (walker.nextNode()) nodes.push(walker.currentNode);
+            nodes.forEach(function (node) {
+                const jp = fixText(node.nodeValue);
+                if (jp !== null) node.nodeValue = jp;
             });
         }
 
         patch();
         new MutationObserver(patch).observe(doc.body, { childList: true, subtree: true });
-        setInterval(patch, 400);
+        setInterval(patch, 300);
         </script>
         """,
         height=0,
