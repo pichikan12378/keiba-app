@@ -469,6 +469,19 @@ def fetch_race_menu(meeting_id, is_local):
 def build_race_id(base_id, race_no):
     return f"{base_id}{int(race_no):02d}"
 
+_HORSE_COLS = {
+    "馬番": st.column_config.NumberColumn("馬番", format="%d"),
+    "単勝": st.column_config.NumberColumn("単勝", format="%.1f倍"),
+    "人気": st.column_config.NumberColumn("人気", format="%d番人気"),
+}
+
+def _horse_table(rows):
+    """馬番・単勝・人気を数値のまま返す（文字列にすると並べ替えが辞書順になるため）。"""
+    ranked = sorted([r for r in rows if r["単勝"]], key=lambda r: r["単勝"])
+    pop = {r["馬番"]: i + 1 for i, r in enumerate(ranked)}
+    return [{"馬番": r["馬番"], "馬名": r["馬名"], "騎手": r["騎手"],
+             "単勝": r["単勝"], "人気": pop.get(r["馬番"])} for r in rows]
+
 def render_race_info(race, key_suffix=""):
     """出馬表＋単勝オッズを表示する共通パーツ。"""
     race_id = race.get("sn_race_id")
@@ -488,13 +501,9 @@ def render_race_info(race, key_suffix=""):
             st.code("\n".join(res["log"]) or "ログなし")
         return []
 
-    ranked = sorted([r for r in rows if r["単勝"]], key=lambda r: r["単勝"])
-    pop = {r["馬番"]: i + 1 for i, r in enumerate(ranked)}
     st.dataframe(
-        [{"馬番": r["馬番"], "馬名": r["馬名"], "騎手": r["騎手"],
-          "単勝": f"{r['単勝']:.1f}倍" if r["単勝"] else "—",
-          "人気": f"{pop[r['馬番']]}番人気" if r["馬番"] in pop else "—"} for r in rows],
-        use_container_width=True, hide_index=True,
+        _horse_table(rows), use_container_width=True, hide_index=True,
+        column_config=_HORSE_COLS,
     )
     return rows
 
@@ -634,8 +643,10 @@ if st.session_state.current_page == "main":
             with st.container(border=True):
                 # 本命ありの場合はタイトル横にアイコンを表示
                 fav_icon = "🎯(本命あり)" if race.get("use_favorite") else ""
+                name_line = f"{race['race_name']}\n\n" if race.get("race_name") else ""
                 st.markdown(
                     f"**{race['title']}** {fav_icon}\n\n"
+                    f"{name_line}"
                     f"（全{race['total_horses']}頭立 / 各{race['target_count']}頭選択）"
                 )
 
@@ -747,10 +758,9 @@ elif st.session_state.current_page == "create":
             )
             with st.expander("取得した出馬表を確認", expanded=False):
                 st.dataframe(
-                    [{"馬番": r["馬番"], "馬名": r["馬名"], "騎手": r["騎手"],
-                      "単勝": f"{r['単勝']:.1f}倍" if r["単勝"] else "—"}
-                     for r in st.session_state.cr_preview],
+                    _horse_table(st.session_state.cr_preview),
                     use_container_width=True, hide_index=True,
+                    column_config=_HORSE_COLS,
                 )
 
     # ---- ⑤ 残りの設定 ----
@@ -780,12 +790,10 @@ elif st.session_state.current_page == "create":
             weekdays = ["月", "火", "水", "木", "金", "土", "日"]
             date_str = f"{selected_date.month}/{selected_date.day}({weekdays[selected_date.weekday()]})"
             race_name = st.session_state.get("cr_race_name", "") if sn_race_id else ""
-            title = f"{date_str} {jyo} {r_num}"
-            if race_name:
-                title += f" {race_name}"
             new_race = {
                 "id": uuid.uuid4().hex,
-                "title": title,
+                "title": f"{date_str} {jyo} {r_num}",
+                "race_name": race_name,   # タイトルとは分けて保持
                 "total_horses": total_horses,
                 "target_count": target_count,
                 "use_favorite": use_favorite,  # 設定を保存
@@ -813,6 +821,8 @@ elif st.session_state.current_page == "member_select":
     race = get_active_race()
     st.title("👤 参加者を選択")
     st.write(f"**{race['title']}** （各{race['target_count']}頭選択）")
+    if race.get("race_name"):
+        st.caption(race["race_name"])
 
     for member in race["members"]:
         mid = member["id"]
@@ -848,6 +858,8 @@ elif st.session_state.current_page == "input_choices":
     target = race["target_count"]
     st.title(f"🏇 {member['name']} さんの馬番入力")
     st.write(f"{race['title']} （{race['total_horses']}頭立から**ちょうど{target}頭**）")
+    if race.get("race_name"):
+        st.caption(race["race_name"])
 
     render_race_info(race, key_suffix="input")
 
@@ -928,6 +940,8 @@ elif st.session_state.current_page == "result":
 
     st.title("📊 集約＆買い目計算")
     st.subheader(f"【 {race['title']} 】")
+    if race.get("race_name"):
+        st.caption(race["race_name"])
 
     member_ids = [m["id"] for m in race["members"]]
     all_selected = [h for mid in member_ids for h in race["choices"].get(mid, [])]
@@ -1031,8 +1045,11 @@ elif st.session_state.current_page == "result":
             with st.expander(f"📋 {ticket_type} 買い目・金額一覧（全{total_points}点）"):
                 st.dataframe(
                     [{"買い目": " - ".join(map(str, c)),
-                      "購入金額": f"{per_ticket_amount:,}円"} for c in combos],
+                      "購入金額": per_ticket_amount} for c in combos],
                     use_container_width=True, hide_index=True,
+                    column_config={
+                        "購入金額": st.column_config.NumberColumn("購入金額", format="%d円"),
+                    },
                 )
         else:
             col2.metric("1点あたり", "予算不足", delta="-不足", delta_color="inverse")
