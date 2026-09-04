@@ -176,7 +176,7 @@ DATA_FILE = Path("races_data.json")
 # ============================================================
 import re
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -382,8 +382,10 @@ def _parse_meta(html):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_meetings(is_local):
-    """トップページから開催一覧（開催ID）を拾う。
-    レースIDは「開催ID(8桁) + レース番号(2桁)」で組み立てる。"""
+    """トップページから直近の開催（開催ID・競馬場名・開催日）を拾う。
+      中央: 開催ID=8桁（YY場回日） / レースID = 開催ID + R(2桁)
+      地方: 開催ID=10桁（YYYYMMDD+場コード）→ 日次を含む14桁のレースIDは
+            一覧ページから取得する（fetch_race_menu）"""
     base = BASE_LOCAL if is_local else BASE_CHUO
     names = [j.replace("ば", "") for j in (JYO_CHIHO if is_local else JYO_CHUO)]
     status, html, err = _get(base + "/")
@@ -391,18 +393,66 @@ def fetch_meetings(is_local):
         return []
 
     soup = BeautifulSoup(html, "html.parser")
-    found = {}
-    for a in soup.find_all("a", href=True):
-        m = re.search(r"/race/(list|index)/(\d{8,})", a["href"])
+    results = {}
+    cur_date = None
+    this_year = datetime.date.today().year
+
+    for node in soup.descendants:
+        # 文字列ノードに日付が出てきたら、以降のリンクはその日の開催とみなす
+        if isinstance(node, NavigableString):
+            m = re.search(r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日", str(node))
+            if m:
+                try:
+                    cur_date = datetime.date(int(m.group(1) or this_year),
+                                             int(m.group(2)), int(m.group(3)))
+                except ValueError:
+                    pass
+            continue
+
+        if getattr(node, "name", None) != "a" or not node.get("href"):
+            continue
+        m = re.search(r"/race/(list|index)/(\d{8,})", node["href"])
         if not m:
             continue
-        kind, num = m.group(1), m.group(2)
-        base_id = num if kind == "list" else num[:-2]   # index は末尾2桁がR
-        label = a.get_text(" ", strip=True)
+        num = m.group(2)
+        mid = num if m.group(1) == "list" else num[:-2]
+        label = node.get_text(" ", strip=True)
         if not label or not any(n in label for n in names):
             continue
-        found.setdefault(base_id, label)
-    return [{"id": k, "label": v} for k, v in found.items()]
+
+        day = cur_date
+        if len(mid) >= 10:      # 地方は先頭8桁が開催日
+            try:
+                day = datetime.date(int(mid[:4]), int(mid[4:6]), int(mid[6:8]))
+            except ValueError:
+                pass
+        results.setdefault(mid, {"id": mid, "label": label, "date": day})
+
+    return sorted(results.values(), key=lambda m: (m["date"] or datetime.date.min, m["label"]))
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_race_menu(meeting_id, is_local):
+    """開催一覧ページから {レース番号: レースID} を取り出す。"""
+    base = BASE_LOCAL if is_local else BASE_CHUO
+    status, html, err = _get(f"{base}/race/list/{meeting_id}")
+    if status != 200 or not html:
+        return {}
+
+    soup = BeautifulSoup(html, "html.parser")
+    mid = str(meeting_id)
+    menu = {}
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/race/(?:index|denma)/(\d{8,})", a["href"])
+        if not m:
+            continue
+        rid = m.group(1)
+        if not rid.startswith(mid) or len(rid) <= len(mid):
+            continue
+        try:
+            menu[int(rid[-2:])] = rid
+        except ValueError:
+            pass
+    return menu
 
 def build_race_id(base_id, race_no):
     return f"{base_id}{int(race_no):02d}"
@@ -610,50 +660,60 @@ elif st.session_state.current_page == "create":
     st.session_state.setdefault("cr_race_name", "")
     st.session_state.setdefault("cr_preview", [])
 
+    # ---- ① 開催日付と区分 ----
     selected_date = st.date_input("開催日付", value=st.session_state.cr_date, format="YYYY/MM/DD")
-
     cat = st.selectbox("開催区分", ["中央", "地方"])
-    jyo_list = JYO_CHUO if cat == "中央" else JYO_CHIHO
-    jyo = st.selectbox("競馬場", jyo_list)
-    r_num = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=10)
+    is_local = (cat == "地方")
 
-    # 🌟 出馬表・オッズの連携（任意）
-    st.markdown("##### 📰 出馬表・オッズの連携（任意）")
-    link_mode = st.radio(
-        "レースの指定方法",
-        ["連携しない", "開催から自動取得", "URLを貼り付け"],
-        horizontal=False,
-    )
+    # ---- ② その日の開催候補を出す ----
+    st.markdown("##### 🏟 開催の選択")
+    meetings = fetch_meetings(is_local)
+    same_day = [m for m in meetings if m["date"] == selected_date]
+    cands = same_day or meetings
+
+    if not meetings:
+        st.warning("開催情報を取得できませんでした。手入力に切り替えてください。")
+    elif not same_day:
+        st.info("選択した日付の開催は見つかりませんでした（取得できるのは直近数日ぶんです）。"
+                "下の一覧から選ぶか、手入力に切り替えてください。")
+
+    def _mlabel(m):
+        d = m["date"]
+        return f"{m['label']}（{d.month}/{d.day}）" if d else m["label"]
+
+    MANUAL = "― 連携しない（手入力）―"
+    options = [_mlabel(m) for m in cands] + [MANUAL]
+    picked = st.selectbox("開催", options, index=0 if cands else len(options) - 1)
+
     sn_race_id = ""
-
-    if link_mode == "開催から自動取得":
-        meetings = fetch_meetings(cat == "地方")
-        if not meetings:
-            st.warning("開催情報を取得できませんでした。URL貼り付けをお試しください。")
-        else:
-            key = jyo.replace("ば", "")
-            cands = [m for m in meetings if key in m["label"]] or meetings
-            pick = st.selectbox("開催を選択", [m["label"] for m in cands])
-            base_id = next(m["id"] for m in cands if m["label"] == pick)
-            sn_race_id = build_race_id(base_id, r_num[:-1])
-            st.caption(f"レースID: `{sn_race_id}`（{pick} の {r_num}）")
-            st.caption("※ 取得できるのは前後数日の開催のみです。")
-
-    elif link_mode == "URLを貼り付け":
-        st.caption(
-            "スポーツナビで対象レースのページを開き、URLを貼り付けてください。\n\n"
-            "例: sports.yahoo.co.jp/keiba/race/index/**2604030408**（IDだけでもOK）"
-        )
-        sn_url = st.text_input("レースURL または レースID", value="", placeholder="貼り付けると連携されます")
+    if picked == MANUAL:
+        jyo = st.selectbox("競馬場", JYO_CHUO if not is_local else JYO_CHIHO)
+        r_num = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=10)
+        sn_url = st.text_input("スポナビのレースURL（任意）", value="",
+                               placeholder="貼り付けると出馬表を取得できます")
         sn_race_id = parse_race_id(sn_url)
         if sn_url and not sn_race_id:
             st.warning("URLからレースIDを読み取れませんでした。")
+    else:
+        meeting = cands[options.index(picked)]
+        jyo = meeting["label"]
+        if meeting["date"]:
+            selected_date = meeting["date"]
 
-    # 🌟 取得内容をレース設定に反映する
+        # ---- ③ その開催のレース番号を出す ----
+        menu = fetch_race_menu(meeting["id"], is_local)
+        race_nos = sorted(menu) if menu else list(range(1, 13))
+        r_int = st.selectbox("レース番号", race_nos, index=len(race_nos) - 1,
+                             format_func=lambda n: f"{n}R")
+        r_num = f"{r_int}R"
+        sn_race_id = menu.get(r_int) or build_race_id(meeting["id"], r_int)
+        st.caption(f"レースID: `{sn_race_id}`")
+
+    # ---- ④ 出馬表を取得して設定に反映 ----
     if sn_race_id:
-        if st.button("📥 出馬表を取得して設定に反映", use_container_width=True):
+        if st.button("📥 出馬表を取得して設定に反映", type="secondary", use_container_width=True):
             fetch_race_info.clear()
-            res = fetch_race_info(sn_race_id, cat == "地方")
+            res = fetch_race_info(sn_race_id, is_local)
             if not res["rows"]:
                 st.error("出馬表を取得できませんでした。下の取得ログをご確認ください。")
                 with st.expander("🔧 取得ログ", expanded=True):
@@ -681,6 +741,8 @@ elif st.session_state.current_page == "create":
                     use_container_width=True, hide_index=True,
                 )
 
+    # ---- ⑤ 残りの設定 ----
+    st.markdown("##### 🎫 買い方の設定")
     horse_options = list(range(4, 19))
     cur = st.session_state.cr_total_horses
     total_horses = st.selectbox(
@@ -690,7 +752,6 @@ elif st.session_state.current_page == "create":
     )
     target_count = st.selectbox("1人あたりの選択頭数", [2, 3, 4, 5], index=0)
 
-    # 🌟 本命指定の有無を設定（【修正2】初期値はチェックなし）
     st.markdown("##### 🎯 本命の設定")
     use_favorite = st.checkbox("各メンバーに「本命馬(◎)」を1頭指定させる", value=False)
 
