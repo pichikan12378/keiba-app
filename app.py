@@ -169,17 +169,29 @@ DATA_FILE = Path("races_data.json")
 
 # ============================================================
 # 出馬表・単勝オッズの取得（スポーツナビ）
-#   出馬表 : /race/denma/{race_id}      → 馬番・馬名・騎手
-#   オッズ : /race/odds/tfw/{race_id}   → 馬番・単勝
+#   出馬表 : /race/denma/{race_id}
+#     → 枠番・馬番・馬名・騎手名・馬体重・人気(オッズ) が1ページに揃う
+#   オッズ : /race/odds/tfw/{race_id}  … 発売中の最新単勝で上書き（任意）
 #   ※ 個人利用の範囲で。連打しないよう2分キャッシュしています。
 # ============================================================
 import re
 import requests
 from bs4 import BeautifulSoup
 
-UA = {"User-Agent": "Mozilla/5.0 (compatible; personal-hobby-app)"}
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/122.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+}
+BASE_CHUO = "https://sports.yahoo.co.jp/keiba"
+BASE_LOCAL = "https://sports.yahoo.co.jp/keiba_local"
+
 RE_HORSE = re.compile(r"/directory/horse/")
 RE_JOCKEY = re.compile(r"/directory/jockey/")
+RE_ODDS_CELL = re.compile(r"^\d+\s*\(\s*(\d+\.\d+)\s*\)$")   # 例: 8(22.0)
+RE_PLAIN_ODDS = re.compile(r"^\d+(?:\.\d+)?$")
 
 def parse_race_id(text):
     """URLでもID直打ちでも、数字の並びだけ取り出す。"""
@@ -189,19 +201,23 @@ def parse_race_id(text):
     return m[-1] if m else ""
 
 def _get(url):
-    res = requests.get(url, headers=UA, timeout=10)
-    res.raise_for_status()
-    res.encoding = res.apparent_encoding
-    return res.text
+    """(ステータス, HTML, エラー文) を返す。例外は投げない。"""
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=15)
+    except Exception as e:
+        return None, "", f"{type(e).__name__}: {e}"
+    if res.status_code != 200:
+        return res.status_code, "", ""
+    res.encoding = res.apparent_encoding or "utf-8"
+    return res.status_code, res.text, ""
 
-def _parse_table(html, kind):
-    """馬名リンクを起点に行を解析する（列位置の変更に強い）。"""
+def _parse_denma(html):
+    """出馬表を解析。馬名リンクを起点にするので列位置の変更に強い。"""
     soup = BeautifulSoup(html, "html.parser")
     result = {}
     for tr in soup.find_all("tr"):
         cells = tr.find_all(["td", "th"])
-        idx = None
-        horse_a = None
+        idx = horse_a = None
         for i, c in enumerate(cells):
             a = c.find("a", href=RE_HORSE)
             if a:
@@ -214,89 +230,92 @@ def _parse_table(html, kind):
         nums = [t for t in texts[:idx] if re.fullmatch(r"\d{1,2}", t)]
         if not nums:
             continue
-        umaban = int(nums[-1])          # 枠番のあとに来る数字＝馬番
 
-        rec = result.setdefault(umaban, {"馬番": umaban})
-        rec["馬名"] = horse_a.get_text(strip=True)
-
-        if kind == "odds":
-            # 馬名より後ろの最初の小数＝単勝（複勝は "1.5 - 2.2" なので除外される）
-            odd = next((t for t in texts[idx + 1:]
-                        if re.fullmatch(r"\d+(\.\d+)?", t)), None)
-            rec["単勝"] = float(odd) if odd else None
-        else:
-            j = tr.find("a", href=RE_JOCKEY)
-            rec["騎手"] = j.get_text(strip=True) if j else ""
+        umaban = int(nums[-1])                     # 枠番のあとの数字＝馬番
+        j = tr.find("a", href=RE_JOCKEY)
+        odds = None
+        for t in reversed(texts[idx + 1:]):        # 「人気(オッズ)」は行の後方
+            m = RE_ODDS_CELL.match(t.replace(" ", ""))
+            if m:
+                odds = float(m.group(1))
+                break
+        result[umaban] = {
+            "馬番": umaban,
+            "馬名": horse_a.get_text(strip=True),
+            "騎手": j.get_text(strip=True) if j else "",
+            "単勝": odds,
+        }
     return result
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_meetings(is_local):
-    """スポナビのトップページから開催一覧（開催ID）を拾う。
-    レースIDは「開催ID(8桁) + レース番号(2桁)」で組み立てられる。"""
-    base = "https://sports.yahoo.co.jp/keiba_local" if is_local else "https://sports.yahoo.co.jp/keiba"
-    names = [j.replace("ば", "") for j in (JYO_CHIHO if is_local else JYO_CHUO)]
-    try:
-        soup = BeautifulSoup(_get(base + "/"), "html.parser")
-    except Exception:
-        return []
-
-    found = {}
-    for a in soup.find_all("a", href=True):
-        m = re.search(r"/race/(list|index)/(\d{8,})", a["href"])
-        if not m:
+def _parse_odds(html):
+    """単複オッズ表から最新の単勝だけ拾う。"""
+    soup = BeautifulSoup(html, "html.parser")
+    result = {}
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all(["td", "th"])
+        idx = horse_a = None
+        for i, c in enumerate(cells):
+            a = c.find("a", href=RE_HORSE)
+            if a:
+                idx, horse_a = i, a
+                break
+        if horse_a is None:
             continue
-        kind, num = m.group(1), m.group(2)
-        base_id = num if kind == "list" else num[:-2]   # index は末尾2桁がR
-        label = a.get_text(" ", strip=True)
-        # 競馬場名を含むリンクだけを開催の目印にする
-        if not label or not any(n in label for n in names):
+        texts = [c.get_text(" ", strip=True) for c in cells]
+        nums = [t for t in texts[:idx] if re.fullmatch(r"\d{1,2}", t)]
+        if not nums:
             continue
-        found.setdefault(base_id, label)
-    return [{"id": k, "label": v} for k, v in found.items()]
-
-def build_race_id(base_id, race_no):
-    return f"{base_id}{int(race_no):02d}"
+        odd = next((t for t in texts[idx + 1:] if RE_PLAIN_ODDS.fullmatch(t)), None)
+        if odd:
+            result[int(nums[-1])] = float(odd)
+    return result
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_race_info(race_id, is_local):
-    """馬番・馬名・騎手・単勝オッズを取得して馬番順のリストで返す。"""
-    base = "https://sports.yahoo.co.jp/keiba_local" if is_local else "https://sports.yahoo.co.jp/keiba"
-    data = {}
-    for kind, url in (("denma", f"{base}/race/denma/{race_id}"),
-                      ("odds", f"{base}/race/odds/tfw/{race_id}")):
-        try:
-            parsed = _parse_table(_get(url), kind)
-        except Exception:
-            parsed = {}
-        for num, rec in parsed.items():
-            data.setdefault(num, {}).update(rec)
+    """{"rows": [...], "log": [...], "meta": {...}} を返す。中央/地方は自動で両方試す。"""
+    log = []
+    bases = [BASE_LOCAL, BASE_CHUO] if is_local else [BASE_CHUO, BASE_LOCAL]
 
-    rows = []
-    for num in sorted(data):
-        r = data[num]
-        rows.append({
-            "馬番": num,
-            "馬名": r.get("馬名", ""),
-            "騎手": r.get("騎手", ""),
-            "単勝": r.get("単勝"),
-        })
-    return rows
+    for base in bases:
+        url = f"{base}/race/denma/{race_id}"
+        status, html, err = _get(url)
+        if err:
+            log.append(f"{url}\n　→ 通信エラー {err}")
+            continue
+        if status != 200:
+            log.append(f"{url}\n　→ HTTP {status}")
+            continue
 
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_race_meta(race_id, is_local):
-    """レース名・開催日・発走時刻を取得する。"""
-    base = "https://sports.yahoo.co.jp/keiba_local" if is_local else "https://sports.yahoo.co.jp/keiba"
-    try:
-        soup = BeautifulSoup(_get(f"{base}/race/denma/{race_id}"), "html.parser")
-    except Exception:
-        return {}
+        data = _parse_denma(html)
+        log.append(f"{url}\n　→ HTTP 200 / {len(data)}頭を検出")
+        if not data:
+            continue
 
+        # 発売中なら最新の単勝で上書き（失敗しても致命的ではない）
+        o_url = f"{base}/race/odds/tfw/{race_id}"
+        o_status, o_html, o_err = _get(o_url)
+        if o_status == 200 and o_html:
+            latest = _parse_odds(o_html)
+            for num, val in latest.items():
+                if num in data:
+                    data[num]["単勝"] = val
+            log.append(f"{o_url}\n　→ HTTP 200 / 単勝{len(latest)}件を反映")
+        else:
+            log.append(f"{o_url}\n　→ 取得できず（出馬表のオッズを使用）")
+
+        return {"rows": [data[n] for n in sorted(data)], "log": log,
+                "meta": _parse_meta(html), "base": base}
+
+    return {"rows": [], "log": log, "meta": {}, "base": None}
+
+def _parse_meta(html):
+    """レース名・開催日・発走時刻を取り出す。"""
+    soup = BeautifulSoup(html, "html.parser")
     meta = {}
     title = soup.title.get_text(strip=True) if soup.title else ""
     m = re.match(r"競馬\s*-\s*(?:\d{4}年)?(.*?)\s*(?:出馬表|オッズ|予想|結果)\s*-\s*スポーツナビ", title)
     if m:
         meta["race_name"] = m.group(1).strip()
-
     text = soup.get_text(" ", strip=True)
     d = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
     if d:
@@ -309,6 +328,33 @@ def fetch_race_meta(race_id, is_local):
         meta["post_time"] = t.group(1)
     return meta
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_meetings(is_local):
+    """トップページから開催一覧（開催ID）を拾う。
+    レースIDは「開催ID(8桁) + レース番号(2桁)」で組み立てる。"""
+    base = BASE_LOCAL if is_local else BASE_CHUO
+    names = [j.replace("ば", "") for j in (JYO_CHIHO if is_local else JYO_CHUO)]
+    status, html, err = _get(base + "/")
+    if status != 200 or not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    found = {}
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/race/(list|index)/(\d{8,})", a["href"])
+        if not m:
+            continue
+        kind, num = m.group(1), m.group(2)
+        base_id = num if kind == "list" else num[:-2]   # index は末尾2桁がR
+        label = a.get_text(" ", strip=True)
+        if not label or not any(n in label for n in names):
+            continue
+        found.setdefault(base_id, label)
+    return [{"id": k, "label": v} for k, v in found.items()]
+
+def build_race_id(base_id, race_no):
+    return f"{base_id}{int(race_no):02d}"
+
 def render_race_info(race, key_suffix=""):
     """出馬表＋単勝オッズを表示する共通パーツ。"""
     race_id = race.get("sn_race_id")
@@ -320,9 +366,12 @@ def render_race_info(race, key_suffix=""):
     if c2.button("🔄 更新", key=f"rf_{race['id']}_{key_suffix}", use_container_width=True):
         fetch_race_info.clear()
 
-    rows = fetch_race_info(race_id, race.get("sn_local", False))
+    res = fetch_race_info(race_id, race.get("sn_local", False))
+    rows = res["rows"]
     if not rows:
-        st.caption("※ データを取得できませんでした（発売前・レースID違い・サイト構造変更など）")
+        st.caption("※ データを取得できませんでした（発売前・レースID違いなど）")
+        with st.expander("🔧 取得ログ"):
+            st.code("\n".join(res["log"]) or "ログなし")
         return []
 
     ranked = sorted([r for r in rows if r["単勝"]], key=lambda r: r["単勝"])
@@ -552,14 +601,15 @@ elif st.session_state.current_page == "create":
     if sn_race_id:
         if st.button("📥 出馬表を取得して設定に反映", use_container_width=True):
             fetch_race_info.clear()
-            fetch_race_meta.clear()
-            rows = fetch_race_info(sn_race_id, cat == "地方")
-            meta = fetch_race_meta(sn_race_id, cat == "地方")
-            if not rows:
-                st.error("出馬表を取得できませんでした。レースIDをご確認ください。")
+            res = fetch_race_info(sn_race_id, cat == "地方")
+            if not res["rows"]:
+                st.error("出馬表を取得できませんでした。下の取得ログをご確認ください。")
+                with st.expander("🔧 取得ログ", expanded=True):
+                    st.code("\n".join(res["log"]) or "ログなし")
             else:
-                st.session_state.cr_preview = rows
-                st.session_state.cr_total_horses = len(rows)
+                meta = res["meta"]
+                st.session_state.cr_preview = res["rows"]
+                st.session_state.cr_total_horses = len(res["rows"])
                 if meta.get("date"):
                     st.session_state.cr_date = meta["date"]
                 st.session_state.cr_race_name = meta.get("race_name", "")
